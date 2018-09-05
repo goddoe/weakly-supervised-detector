@@ -6,17 +6,13 @@ from tqdm import tqdm
 
 import tensorflow as tf
 import numpy as np
-import matplotlib.pyplot as plt
 
 from models.tf_template import BaseTfClassifier
 from models.inception.inception_v3 import inception_v3_base, inception_v3_arg_scope
 from models.inception.inception_v1 import inception_v1_base, inception_v1_arg_scope
 from models.alexnet.alexnet_v2 import alexnet_v2_base, alexnet_v2_arg_scope
-from models.preprocessing import inception_preprocessing
 from libs.various_utils import generate_id_with_date, get_date_time_prefix
-from libs.image_utils import (get_random_patch_list,
-                              random_hide,
-                              find_location_by_cam)
+from libs.image_utils import find_location_by_cam
 
 slim = tf.contrib.slim
 
@@ -30,6 +26,7 @@ IMAGE_PREPROCESSED_MEAN = -0.11571
 
 
 def build_inception_v3_base(X, is_training, final_endpoint='Mixed_7c'):
+    final_endpoint = 'Mixed_7c' if final_endpoint is None else final_endpoint
     with slim.arg_scope(inception_v3_arg_scope()):
         with slim.arg_scope([slim.batch_norm, slim.dropout],
                             is_training=is_training):
@@ -40,6 +37,7 @@ def build_inception_v3_base(X, is_training, final_endpoint='Mixed_7c'):
 
 
 def build_inception_v1_base(X, is_training, final_endpoint='Mixed_5c'):
+    final_endpoint = 'Mixed_5c' if final_endpoint is None else final_endpoint
     with slim.arg_scope(inception_v1_arg_scope()):
         with slim.arg_scope([slim.batch_norm, slim.dropout],
                             is_training=is_training):
@@ -57,7 +55,7 @@ def build_alexnet_v2_base(X, is_training, final_endpoint='conv5'):
     'alexnet_v2/conv5'
     'alexnet_v2/pool5'
     """
-
+    final_endpoint = 'conv5' if final_endpoint is None else final_endpoint
     with slim.arg_scope(inception_v1_arg_scope()):
         with slim.arg_scope([slim.batch_norm, slim.dropout],
                             is_training=is_training):
@@ -118,8 +116,8 @@ class Detector(BaseTfClassifier):
                  input_shape=None,
                  model_base_input_shape=(224, 224),
                  model_base_name="InceptionV3",
-                 model_base_final_endpoint='Mixed_7c',
-                 model_name="weakly_supervised_detector",
+                 model_base_final_endpoint=None,
+                 model_name="weakly_detector",
                  optimizer=None,
                  cost_function=None,
                  flag_preprocess=False,
@@ -127,7 +125,7 @@ class Detector(BaseTfClassifier):
                  device=None,
                  **kwargs):
         super().__init__()
-        
+
         if optimizer is None:
             optimizer = tf.train.AdamOptimizer
 
@@ -160,13 +158,11 @@ class Detector(BaseTfClassifier):
             self.saver = tf.train.Saver()
 
         self.var_list = self.g.get_collection('variables')
- 
+
         gpu_options = tf.GPUOptions(allow_growth=True)
         self.sess = tf.Session(graph=self.g,
                                config=tf.ConfigProto(gpu_options=gpu_options))
         self.sess.run(tf.variables_initializer(self.var_list))
-
-        self.pool = None
 
 
     def __del__(self):
@@ -197,6 +193,7 @@ class Detector(BaseTfClassifier):
             dropout_keep_prob = tf.placeholder_with_default(1., shape=None, name="dropout_keep_prob")
 
             global_step = tf.Variable(0, trainable=False)
+
 
             X_preprocessed = self.preprocess(X)
 
@@ -232,6 +229,7 @@ class Detector(BaseTfClassifier):
                 cam = build_cam(W=W, last_conv=last_conv, Y=Y, size=self.input_shape[:2],
                                 name='localization')
 
+
         """
         loss
         """
@@ -253,7 +251,6 @@ class Detector(BaseTfClassifier):
                                          optimizer=optimizer_clf,
                                          target_scope=None,
                                          var_list=clf_var_list,
-                                         clip_grad_val=1.0,
                                          name='optimize_clf')
 
         updates = self.optimize(cost=cost,
@@ -268,6 +265,8 @@ class Detector(BaseTfClassifier):
             MODE_TRAIN_GLOBAL: updates,
             MODE_TRAIN_ONLY_CLF: updates_only_clf,
             }
+
+
 
         """
         tensorboard
@@ -311,6 +310,7 @@ class Detector(BaseTfClassifier):
         self.clf_init = clf_init
         self.clf_var_list = clf_var_list
 
+
         self.g.add_to_collection('cam', cam)
         self.g.add_to_collection('Y_pred', Y_pred)
         self.g.add_to_collection('X', X)
@@ -320,16 +320,46 @@ class Detector(BaseTfClassifier):
         self.g.add_to_collection('cost', cost)
         self.g.add_to_collection('is_training', is_training)
 
-    def location(self,
-                 X=None,
-                 Y=None,
-                 cam_list=None,
-                 thresh=0.5,
-                 batch_size=32,
-                 flag_preprocess=True):
+
+    def optimize(self, cost, optimizer, target_scope=None, var_list=None, name=None):
+        with tf.variable_scope(name or 'calc_loss'):
+            with tf.variable_scope('loss'):
+                losses = []
+                l2_regularizer = 0.
+                if target_scope:
+                    losses = [loss for loss in self.g.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES) if loss.name.startswith(tuple(target_scope))]
+                else:
+                    losses = self.g.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+
+                if losses:
+                    l2_regularizer = tf.add_n(losses)
+
+                grad_var_tuple_list = []
+                clip = tf.constant(5.0, name='clip')
+
+                for grad, var in optimizer.compute_gradients(cost + l2_regularizer, var_list=var_list):
+                    if grad is None:
+                        continue
+                    if target_scope:
+                        if not var.name.startswith(tuple(target_scope)):
+                            continue
+                    grad_var_tuple_list.append(
+                        (tf.clip_by_value(grad, -clip, clip), var))
+                updates = optimizer.apply_gradients(grad_var_tuple_list)
+
+        return updates
+
+    def calc_metric(self, Y, Y_pred, name=None):
+        with tf.variable_scope(name or 'metric'):
+            correct_prediction = tf.equal(
+                tf.argmax(Y_pred, 1), tf.argmax(Y, 1))
+            accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float64))
+        return accuracy, correct_prediction
+
+    def location(self, X=None, Y=None, cam_list=None, thresh=0.5, batch_size=32):
         if cam_list is None:
-            cam_list = self.calc_cam(X, Y, batch_size, flag_preprocess)
-        
+            cam_list = self.calc_cam(X, Y, batch_size)
+
         pool = Pool()
 
         bbox_list = pool.starmap(
@@ -338,7 +368,7 @@ class Detector(BaseTfClassifier):
         pool.join()
         return bbox_list
 
-    def calc_cam(self, X, Y, batch_size=32, flag_preprocess=True):
+    def calc_cam(self, X, Y, batch_size=32):
         cam_list = []
 
         n_batch = len(X) // batch_size
@@ -349,12 +379,8 @@ class Detector(BaseTfClassifier):
             batch_y = Y[batch_i *
                         batch_size: (batch_i + 1) * batch_size]
 
-            if flag_preprocess:
-                X_tensor = self.X
-            else:
-                X_tensor = self.X_preprocessed
             batch_cam = self.sess.run(self.cam,
-                                      feed_dict={X_tensor: batch_x,
+                                      feed_dict={self.X: batch_x,
                                                  self.Y: batch_y,
                                                  self.is_training: False})
 
@@ -401,151 +427,10 @@ class Detector(BaseTfClassifier):
         loss /= total_num
         return accuracy, loss, correct, total_num
 
-    def train(self,
-              X_train,
-              Y_train,
-              X_valid,
-              Y_valid,
-              batch_size,
-              n_epoch,
-              learning_rate,
-              reg_lambda=0.,
-              dropout_keep_prob=1.0,
-              patience=100,
-              verbose_interval=20,
-              save_dir_path=None,
-              mode=MODE_TRAIN_GLOBAL,
-              flag_preprocess=True,
-              flag_plot=False,
-              **kwargs):
-        """
-        """
-
-        try:
-            if self.save_dir_path is None and save_dir_path is None:
-                self.save_dir_path = "./tmp/{}".format(generate_id_with_date())
-
-            if save_dir_path:
-                self.save_dir_path = save_dir_path
-
-            os.makedirs(self.save_dir_path)
-        except Exception as e:
-            print("*" * 30)
-            print("Make directory with save_dir_path is failed")
-            print("Maybe, there is directory already or error because of '{}'".format(str(e)))
-
-        X_train_org = X_train
-
-        print("-" * 30)
-        print("train start")
-        patience_origin = patience
-        if self.min_loss is None:
-            self.min_loss = 999999999.
-        for epoch_i in tqdm(range(n_epoch)):
-            rand_idx_list = np.random.permutation(range(len(X_train)))
-            n_batch = len(rand_idx_list) // batch_size
-            for batch_i in range(n_batch):
-                rand_idx = rand_idx_list[batch_i *
-                                         batch_size: (batch_i + 1) * batch_size]
-                batch_x = X_train[rand_idx]
-                batch_y = Y_train[rand_idx]
-
-                self.sess.run(self.update_dict[mode],
-                              feed_dict={self.X: batch_x,
-                                         self.Y: batch_y,
-                                         self.learning_rate: learning_rate,
-                                         self.reg_lambda: reg_lambda,
-                                         self.dropout_keep_prob: dropout_keep_prob,
-                                         self.is_training: True})
-
-            _, valid_accuracy, valid_loss = self.evaluate(
-                X_valid, Y_valid, batch_size)
-            _, train_accuracy, train_loss = self.evaluate(
-                X_train_org, Y_train, batch_size)
-
-            self.report_dict['valid_loss'].append(valid_loss)
-            self.report_dict['train_loss'].append(train_loss)
-            self.report_dict['valid_accuracy'].append(valid_accuracy)
-            self.report_dict['train_accuracy'].append(train_accuracy)
-
-            if verbose_interval:
-                if epoch_i % verbose_interval == 0:
-                    print("-" * 30)
-                    print("epoch_i : {}".format(epoch_i))
-                    print("train loss: {}, train accuracy: {}".format(
-                        train_loss, train_accuracy))
-                    print("valid loss: {}, valid accuracy: {}".format(
-                        valid_loss, valid_accuracy))
-                    print("best valid loss: {}, best valid accuracy : {}".format(
-                        self.min_loss, self.best_accuracy))
-
-            if valid_loss < self.min_loss:
-                patience = patience_origin + 1
-
-                self.min_loss = valid_loss
-                self.best_accuracy = valid_accuracy
-
-                meta = {
-                            'input_shape': self.input_shape,
-                            'output_dim': self.output_dim,
-                            'min_loss': self.min_loss,
-                            'best_accuracy': self.best_accuracy,
-                            'flag_preprocess': self.flag_preprocess,
-                        }
-                self.meta.update(meta)
-                self.save_path = "{}/{}".format(self.save_dir_path, self.model_name)
-                self.best_ckpt_path = self.save(self.save_path)
-
-                print("*" * 30)
-                print("epoh_i : {}".format(epoch_i))
-                print("train loss: {}, train accuracy: {}".format(
-                    train_loss, train_accuracy))
-                print("valid loss: {}, valid accuracy: {}".format(
-                    valid_loss, valid_accuracy))
-                print("best valid loss: {}, best valid accuracy : {}".format(
-                    self.min_loss, self.best_accuracy))
-                print("save current model : {}".format(self.best_ckpt_path))
-
-            patience -= 1
-            if patience <= 0:
-                break
-
-        self.load(self.best_ckpt_path)
-        _, valid_accuracy, valid_loss = self.evaluate(X_valid, Y_valid, batch_size)
-        _, train_accuracy, train_loss = self.evaluate(X_train_org, Y_train, batch_size)
-        self.meta['report_dict'] = self.report_dict
-
-        date_time_prefix = get_date_time_prefix()
-        self.final_model_path = "{}/{}_final_{}".format(self.save_dir_path, date_time_prefix, self.model_name) 
-        self.save(self.final_model_path)
-        print("*"*30)
-        print("final trained performance")
-        print("train loss: {}, train accuracy: {}".format(
-                    train_loss, train_accuracy))
-        print("valid loss: {}, valid accuracy: {}".format(
-                    valid_loss, valid_accuracy))
-        print("best valid loss: {}, best valid accuracy : {}".format(
-                    self.min_loss, self.best_accuracy))
-        print("final_model_path: {}".format(self.final_model_path))
-        print("train done")
-        print("*"*30)
-
-        return self.sess
-
-    def train_with_dataset_api(self,
-                               X,
-                               Y,
-                               init_dataset_train,
-                               init_dataset_valid,
-                               n_epoch,
-                               learning_rate,
-                               reg_lambda,
-                               dropout_keep_prob,
-                               patience,
-                               mode=MODE_TRAIN_GLOBAL,
-                               flag_preprocess=False,
-                               verbose_interval=1,
-                               save_dir_path=None):
+    def train_with_dataset_api(
+            self, X, Y, init_dataset_train, init_dataset_valid,
+            n_epoch, learning_rate, reg_lambda, dropout_keep_prob, patience,
+            mode=MODE_TRAIN_GLOBAL, flag_preprocess=False, verbose_interval=1, save_dir_path=None):
 
         try:
             if self.save_dir_path is None and save_dir_path is None:
@@ -578,17 +463,16 @@ class Detector(BaseTfClassifier):
         else:
             X_tensor = self.X_preprocessed
 
-        train_start_time = time.time() 
+        train_start_time = time.time()
         epoch_tqdm = tqdm(range(n_epoch))
         for epoch_i in epoch_tqdm:
             self.sess.run(init_dataset_train)
             batch_i = 0
             while True:
                 try:
-                    batch_start_time = time.time() 
+                    batch_start_time = time.time()
                     X_batch, Y_batch = self.sess.run([X, Y])
-                    # TODO: remove most descriminative parts here   
-                    
+
                     self.sess.run(
                         self.update_dict[mode],
                         feed_dict={X_tensor: X_batch,
@@ -597,10 +481,10 @@ class Detector(BaseTfClassifier):
                                    self.reg_lambda: reg_lambda,
                                    self.dropout_keep_prob: dropout_keep_prob,
                                    self.is_training: True})
-           
+
                     curr_time = time.time()
                     batch_time = curr_time - batch_start_time
-                
+
                     epoch_tqdm.set_description(
                         "epoch {}, batch {} takes: {:0.2f} sec".format(
                             epoch_i, batch_i, batch_time))
@@ -617,7 +501,7 @@ class Detector(BaseTfClassifier):
             self.report_dict['train_loss'].append(train_loss)
             self.report_dict['valid_accuracy'].append(valid_accuracy)
             self.report_dict['train_accuracy'].append(train_accuracy)
-     
+
             if verbose_interval:
                 if epoch_i % verbose_interval == 0:
                     print("-" * 30)
@@ -635,10 +519,12 @@ class Detector(BaseTfClassifier):
                 self.best_accuracy = valid_accuracy
 
                 meta = {
-                            'input_shape': self.input_shape,
+                            'input_dim': self.input_dim,
                             'output_dim': self.output_dim,
                             'min_loss': self.min_loss,
                             'best_accuracy': self.best_accuracy,
+                            'mean': self.mean,
+                            'std': self.std,
                             'flag_preprocess': self.flag_preprocess,
                         }
                 self.meta.update(meta)
