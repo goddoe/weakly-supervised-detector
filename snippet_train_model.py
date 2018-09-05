@@ -11,11 +11,11 @@ from configs.project_config import project_path
 
 # ==============================================================================
 # Data path and model save path
-tfrecord_train_dir = "{}/data/tiny_imagenet_200/tfrecord/train".format(project_path)
-tfrecord_valid_dir = "{}/data/tiny_imagenet_200/tfrecord/valid".format(project_path)
-tfrecord_test_dir = "{}/data/tiny_imagenet_200/tfrecord/test".format(project_path)
+tfrecord_train_dir = "{}/data/tiny-imagenet-200/tfrecord/train".format(project_path)
+tfrecord_valid_dir = "{}/data/tiny-imagenet-200/tfrecord/valid".format(project_path)
+tfrecord_test_dir = "{}/data/tiny-imagenet-200/tfrecord/test".format(project_path)
 
-meta_path = "{}/data/tiny_imagenet_200/meta.pickle".format(project_path)
+meta_path = "{}/data/tiny-imagenet-200/meta.pickle".format(project_path)
 pretrained_ckpt_path = "{}/checkpoints/inception_v3/inception_v3.ckpt".format(project_path)
 model_save_path = "{}/checkpoints/vanila_inception_v3/weakly_supervised_with_inception_v3".format(project_path)
 
@@ -49,7 +49,7 @@ with model.g.as_default():
     d = prepare_data_from_tfrecord(tfrecord_train_dir=tfrecord_train_dir,
                                    tfrecord_valid_dir=tfrecord_valid_dir,
                                    tfrecord_test_dir=tfrecord_test_dir,
-                                   batch_size=200)
+                                   batch_size=64)
     (X, Y,
      init_dataset_train,
      init_dataset_train_has,
