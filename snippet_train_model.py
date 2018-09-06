@@ -52,10 +52,8 @@ with model.g.as_default():
                                    batch_size=64)
     (X, Y,
      init_dataset_train,
-     init_dataset_train_has,
      init_dataset_valid) = (d['X'], d['Y'],
                             d['init_dataset_train'],
-                            d['init_dataset_train_has'],
                             d['init_dataset_valid'])
 
     """
