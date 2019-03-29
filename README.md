@@ -41,8 +41,3 @@ and open load_and_test.ipynb
 ```
 
 
-- - -
-Author
-+ Sung-ju Kim
-+ goddoe2@gmail.com
-
